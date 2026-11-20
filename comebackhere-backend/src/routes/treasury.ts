@@ -275,7 +275,7 @@ export async function executeSettlementWithBalanceCheck(
       available: balance.toString(),
       token: tokenContract,
       msg: "Executing settlement balance check",
-    }),
+    }
   )
 
   if (balance < settlement.amount) {
