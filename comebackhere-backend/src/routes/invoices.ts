@@ -56,11 +56,23 @@ export async function createInvoice(
     )
   }
 
+  if (!Number.isSafeInteger(body.amount) || body.amount <= 0) {
+    throw Object.assign(new Error("amount must be a positive integer in the token's smallest unit"), { status: 400 })
+  }
+  if (typeof body.token !== "string" || !body.token.trim()) {
+    throw Object.assign(new Error("token is required"), { status: 400 })
+  }
+
   const keypair = Keypair.fromSecret(signerSecret)
   const contract = new Contract(contractId)
 
   const now = Math.floor(Date.now() / 1000)
-  const expiresInSeconds = BigInt(body.due_date - now)
+  // A due date at or before "now" would produce a negative/zero expiry, which
+  // BigInt/u64 encoding cannot represent and would surface as an unexpected exception.
+  if (!Number.isFinite(body.due_date) || body.due_date <= now) {
+    throw Object.assign(new Error("due_date must be in the future"), { status: 400 })
+  }
+  const expiresInSeconds = BigInt(Math.trunc(body.due_date - now))
 
   const args = [
     nativeToScVal(body.merchant_address, { type: "address" }),
@@ -131,6 +143,22 @@ export async function createInvoice(
 
 const ALLOWED_STATUSES: InvoiceStatus[] = ["Pending", "Paid", "Expired", "Cancelled", "RefundRequested", "Released"]
 const ALLOWED_DATE_FIELDS = ["created_at", "due_date", "updated_at"] as const
+
+const MAX_U64 = 18_446_744_073_709_551_615n
+
+/** Normalizes a path invoice ID (strips leading zeros) and rejects values outside u64. */
+export function normalizeInvoiceId(raw: string): string {
+  let value: bigint
+  try {
+    value = BigInt(raw)
+  } catch {
+    throw Object.assign(new Error("id must be a positive integer"), { status: 400 })
+  }
+  if (value < 0n || value > MAX_U64) {
+    throw Object.assign(new Error("id must fit in an unsigned 64-bit integer"), { status: 400 })
+  }
+  return value.toString()
+}
 
 export interface ListFilters {
   status?: InvoiceStatus
@@ -375,7 +403,7 @@ router.get("/export.csv", async (req: Request, res: Response) => {
   let cursor: FindCursor<WithId<InvoiceRecord>> | undefined
   try {
     const db = await connectMongo()
-    cursor = getInvoicesCollection(db).find(buildListFilter(filters)).sort({ created_at: -1 })
+    cursor = getInvoicesCollection(db).find(buildListFilter(filters)).sort({ created_at: -1 }).batchSize(500)
 
     // Rows are written as they arrive from the Mongo cursor, so memory use
     // stays flat regardless of how many invoices are exported. Headers are
@@ -410,7 +438,7 @@ router.get("/export.csv", async (req: Request, res: Response) => {
     } else {
       // Mid-stream failure: abort so the client sees a truncated download
       // rather than a file that silently looks complete.
-      res.locals.logger.error(
+      res.locals.logger?.error(
         { errorName: err instanceof Error ? err.name : "UnknownError" },
         "Invoice CSV export failed mid-stream",
       )
@@ -506,7 +534,8 @@ router.get("/", validateQuery(invoiceListQuerySchema), asyncHandler(async (req: 
   const pageKey = legacyPagination ? `legacy-${page}-${offset}` : `cursor-${query.cursor ?? "first"}`
   const cacheKey = `invoices:${pageKey}:${limit}:${status ?? "all"}:${merchant ?? "all"}`
 
-  const cached = await cacheGet<Record<string, unknown>>(cacheKey)
+  // A cache outage must degrade to a database read, not fail the request.
+  const cached = await cacheGet<Record<string, unknown>>(cacheKey).catch(() => null)
   if (cached) {
     res.json(cached)
     return
@@ -543,7 +572,7 @@ router.get("/", validateQuery(invoiceListQuerySchema), asyncHandler(async (req: 
     Object.assign(result, { total, page, totalPages: Math.ceil(total / limit), offset })
   }
 
-  await cacheSet(cacheKey, result, 30)
+  await Promise.resolve(cacheSet(cacheKey, result, 30)).catch(() => {})
   res.json(result)
 }))
 
@@ -610,9 +639,9 @@ async function syncInvoiceStatus(
       networkPassphrase: env.networkPassphrase,
     })
 
-    // Update the database with the current contract status
+    // Only write when the status actually changed, to avoid a write per read.
     await collection.updateOne(
-      { invoice_id: invoiceId },
+      { invoice_id: invoiceId, status: { $ne: contractStatus } },
       { $set: { status: contractStatus, updated_at: new Date() } }
     )
 
@@ -626,7 +655,7 @@ async function syncInvoiceStatus(
 router.get("/:id", validateParams(invoiceIdParamSchema), asyncHandler(async (req: Request, res: Response) => {
   // Normalize the invoice ID to strip leading zeros so that "042" and "42"
   // resolve to the same invoice (issue #880: mixed-case / zero-padded IDs).
-  const id = String(BigInt(req.params.id))
+  const id = normalizeInvoiceId(req.params.id)
 
   const env = requireEnv({ invoiceContractId: "INVOICE_CONTRACT_ID", rpcUrl: "SOROBAN_RPC_URL", signerSecret: "SIGNER_SECRET_KEY", networkPassphrase: "NETWORK_PASSPHRASE" })
 
@@ -634,7 +663,7 @@ router.get("/:id", validateParams(invoiceIdParamSchema), asyncHandler(async (req
   const collection = getInvoicesCollection(db)
 
   // Get the invoice from database
-  const invoice = await collection.findOne({ invoice_id: id })
+  const invoice = await collection.findOne({ invoice_id: id }, { projection: { _id: 0, status: 1, due_date: 1 } })
   if (!invoice) {
     throw new NotFoundError("Invoice not found")
   }
@@ -692,12 +721,14 @@ router.get("/:id", validateParams(invoiceIdParamSchema), asyncHandler(async (req
  *       404:
  *         description: Invoice not found
  */
+const MAX_EVENTS_PER_INVOICE = 1000
+
 router.get("/:id/events", validateParams(invoiceIdParamSchema), asyncHandler(async (req: Request, res: Response) => {
   // Normalize the invoice ID to strip leading zeros so that "042" and "42"
   // resolve to the same invoice (issue #880: mixed-case / zero-padded IDs).
-  const id = String(BigInt(req.params.id))
+  const id = normalizeInvoiceId(req.params.id)
   const db = await connectMongo()
-  const invoice = await getInvoicesCollection(db).findOne({ invoice_id: id })
+  const invoice = await getInvoicesCollection(db).findOne({ invoice_id: id }, { projection: { _id: 1 } })
 
   if (!invoice) {
     throw new NotFoundError("Invoice not found")
@@ -709,6 +740,7 @@ router.get("/:id/events", validateParams(invoiceIdParamSchema), asyncHandler(asy
       { projection: { _id: 0, event_type: 1, ledger: 1, ledger_closed_at: 1, transaction_hash: 1 } },
     )
     .sort({ ledger: 1, event_id: 1 })
+    .limit(MAX_EVENTS_PER_INVOICE)
     .toArray()
 
   res.json({
@@ -814,7 +846,7 @@ router.post("/", requireMerchantApiKey, validateBody(createInvoiceSchema), async
   const complianceDb = await connectMongo()
   const latestAudit = await getComplianceAuditCollection(complianceDb).findOne(
     { address: body.merchant_address },
-    { sort: { ledger: -1, _id: -1 } },
+    { sort: { ledger: -1, _id: -1 }, projection: { _id: 0, event_type: 1 } },
   )
   if (latestAudit && latestAudit.event_type === "address_blocked") {
     throw new ForbiddenError("Merchant address has been blocked by compliance")
@@ -832,7 +864,7 @@ router.post("/", requireMerchantApiKey, validateBody(createInvoiceSchema), async
   const collection = getInvoicesCollection(db)
 
   // Check for duplicate invoice ID to prevent conflicts (#877)
-  const existing = await collection.findOne({ invoice_id: result.invoice_id })
+  const existing = await collection.findOne({ invoice_id: result.invoice_id }, { projection: { _id: 1 } })
   if (existing) {
     throw Object.assign(
       new Error(`Invoice ID ${result.invoice_id} already exists; please retry to generate a new ID`),
@@ -841,17 +873,29 @@ router.post("/", requireMerchantApiKey, validateBody(createInvoiceSchema), async
   }
 
   const now = new Date()
-  await collection.insertOne({
-    invoice_id: result.invoice_id,
-    merchant_address: body.merchant_address,
-    token: body.token,
-    amount: body.amount,
-    due_date: body.due_date,
-    reference: body.reference,
-    status: "Pending",
-    created_at: now,
-    updated_at: now,
-  })
+  try {
+    await collection.insertOne({
+      invoice_id: result.invoice_id,
+      merchant_address: body.merchant_address,
+      token: body.token,
+      amount: body.amount,
+      due_date: body.due_date,
+      reference: body.reference,
+      status: "Pending",
+      created_at: now,
+      updated_at: now,
+    })
+  } catch (err: unknown) {
+    // Concurrent requests can pass the findOne check above; the unique index
+    // then rejects the loser with E11000, which must be a 409 and not a 500.
+    if (err && typeof err === "object" && (err as { code?: number }).code === 11000) {
+      throw Object.assign(
+        new Error(`Invoice ID ${result.invoice_id} already exists; please retry to generate a new ID`),
+        { status: 409 },
+      )
+    }
+    throw err
+  }
 
   res.status(201).json(result)
 }))
