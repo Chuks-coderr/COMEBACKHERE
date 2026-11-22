@@ -17,6 +17,11 @@ import { logger } from "../lib/logger.js"
 const CURSOR_ID = "treasury_settlement_events"
 const POLL_INTERVAL_MS = 5_000
 const EVENT_LIMIT = 100
+// Upper bound on the number of processed event IDs kept in the cursor document.
+// Bounds both the Mongo document size and the in-memory Set used for de-duplication.
+const MAX_PROCESSED_EVENT_IDS = 1_000
+// Maximum number of settlement writes to buffer before flushing to Mongo.
+const DB_WRITE_BATCH_SIZE = 50
 
 function topicSymbol(topic: xdr.ScVal[] | undefined, index: number): string | null {
   return topic?.[index]?.sym()?.toString() ?? null
@@ -46,6 +51,45 @@ async function loadCursor(database: Awaited<ReturnType<typeof connectMongo>>) {
   return existing ?? { _id: CURSOR_ID, paging_token: null, last_ledger: 0, updated_at: new Date() }
 }
 
+/**
+ * Build a bounded in-memory set of already-processed event IDs from the cursor
+ * document. Only the most recent `MAX_PROCESSED_EVENT_IDS` entries are retained
+ * so memory usage stays constant regardless of how long the indexer has run.
+ */
+function loadProcessedEventIds(cursor: { processed_event_ids?: unknown }): Set<string> {
+  const raw = Array.isArray(cursor.processed_event_ids) ? cursor.processed_event_ids : []
+  const bounded = raw.length > MAX_PROCESSED_EVENT_IDS
+    ? raw.slice(-MAX_PROCESSED_EVENT_IDS)
+    : raw
+  const ids = new Set<string>()
+  for (const id of bounded) {
+    if (typeof id === "string") ids.add(id)
+  }
+  return ids
+}
+
+/**
+ * Ensure the settlements collection has the indexes required for the indexer's
+ * hot-path lookups. Index creation is idempotent and safe to call repeatedly.
+ */
+export async function ensureSettlementIndexes(
+  database: Awaited<ReturnType<typeof connectMongo>>,
+): Promise<void> {
+  try {
+    const settlements = getSettlementsCollection(database)
+    await Promise.all([
+      settlements.createIndex({ id: 1 }, { unique: true, background: true }),
+      settlements.createIndex({ status: 1, updated_at: -1 }, { background: true }),
+      settlements.createIndex({ merchant_address: 1 }, { background: true }),
+    ])
+  } catch (err) {
+    logger.error(
+      { errorName: err instanceof Error ? err.name : "UnknownError" },
+      "Failed to ensure settlement indexes",
+    )
+  }
+}
+
 async function saveCursor(
   database: Awaited<ReturnType<typeof connectMongo>>,
   pagingToken: string | null,
@@ -60,15 +104,20 @@ async function saveCursor(
   }
 
   if (newEventIds.length > 0) {
+    // Only push the most recent IDs; the $slice keeps the array bounded so the
+    // cursor document never grows without limit.
+    const boundedIds = newEventIds.length > MAX_PROCESSED_EVENT_IDS
+      ? newEventIds.slice(-MAX_PROCESSED_EVENT_IDS)
+      : newEventIds
     await cursors.updateOne(
       { _id: CURSOR_ID },
       {
         $set: update,
-        // Keep only the most recent 1 000 event IDs to bound document size
+        // Keep only the most recent MAX_PROCESSED_EVENT_IDS event IDs to bound document size
         $push: {
           processed_event_ids: {
-            $each: newEventIds,
-            $slice: -1000,
+            $each: boundedIds,
+            $slice: -MAX_PROCESSED_EVENT_IDS,
           },
         },
       },
@@ -183,6 +232,20 @@ export function buildEventId(
   return `${txHash}:${eventType}:${settlementId}`
 }
 
+type PendingWrite = () => Promise<void>
+
+/**
+ * Flush a buffer of pending settlement writes in bounded chunks so we never
+ * hold an unbounded number of promises in memory and never issue one round-trip
+ * per event. Writes within a chunk run concurrently; chunks run sequentially.
+ */
+async function flushWrites(writes: PendingWrite[]): Promise<void> {
+  for (let i = 0; i < writes.length; i += DB_WRITE_BATCH_SIZE) {
+    const chunk = writes.slice(i, i + DB_WRITE_BATCH_SIZE)
+    await Promise.all(chunk.map((write) => write()))
+  }
+}
+
 export async function processIndexerBatch(
   client: SorobanClient,
   treasuryContractId: string,
@@ -207,11 +270,13 @@ export async function processIndexerBatch(
   // Collect the set of already-processed event IDs stored in the cursor document
   // so we can skip duplicates that appear when replaying an overlapping window
   // after a reorg or an indexer restart that resumed from an earlier ledger.
-  const processedIds: Set<string> = new Set(cursor.processed_event_ids ?? [])
+  // The set is bounded to keep memory usage constant.
+  const processedIds: Set<string> = loadProcessedEventIds(cursor)
 
   let processed = 0
   let lastPagingToken = cursor.paging_token
   const newEventIds: string[] = []
+  const pendingWrites: PendingWrite[] = []
 
   for (const event of response.events ?? []) {
     const eventType = topicSymbol(event.topic, 0)
@@ -239,7 +304,9 @@ export async function processIndexerBatch(
       const token = valueAddress(event.value, 1)
       const amount = valueU64(event.value, 2)
       const merchant = valueAddress(event.value, 3)
-      await processSettlementProposed(settlements, settlementId, token, amount, merchant, txHash)
+      pendingWrites.push(() =>
+        processSettlementProposed(settlements, settlementId, token, amount, merchant, txHash),
+      )
 
       // Dispatch signed webhook for settlement_proposed
       const webhookUrl = process.env.WEBHOOK_URL
@@ -258,8 +325,9 @@ export async function processIndexerBatch(
     } else if (eventType === "settlement_approved") {
       const signer = valueAddress(event.value, 1)
       const newWeight = valueU64(event.value, 3)
-      await processSettlementApproved(settlements, settlementId, signer, newWeight)
-      const settlement = await settlements.findOne({ id: settlementId })
+      pendingWrites.push(() =>
+        processSettlementApproved(settlements, settlementId, signer, newWeight),
+      )
 
       // Dispatch signed webhook for settlement_approved
       const webhookUrl = process.env.WEBHOOK_URL
@@ -275,8 +343,9 @@ export async function processIndexerBatch(
         })
       }
     } else if (eventType === "settlement_executed") {
-      await processSettlementExecuted(settlements, settlementId, txHash)
-      const settlement = await settlements.findOne({ id: settlementId })
+      pendingWrites.push(() =>
+        processSettlementExecuted(settlements, settlementId, txHash),
+      )
 
       // Treasury balances changed on-chain; drop the cached copy so the next
       // GET /api/treasury/balances reads fresh data instead of waiting for TTL.
@@ -288,17 +357,21 @@ export async function processIndexerBatch(
       // and never carries a stale in-memory value from before the DB update.
       const webhookUrl = process.env.WEBHOOK_URL
       if (webhookUrl) {
-        const updatedRecord = await settlements.findOne({ id: settlementId })
-        dispatchWebhook(webhookUrl, {
-          event: "settlement_executed",
-          settlement_id: settlementId,
-          status: updatedRecord?.status ?? "Executed",
-          merchant_address: updatedRecord?.merchant_address ?? "",
-          amount: updatedRecord?.amount ?? "0",
-          token: updatedRecord?.token ?? "",
-          tx_hash: txHash,
-        }, undefined, fetch, { eventId }).catch((err: unknown) => {
-          logger.error({ errorName: err instanceof Error ? err.name : "UnknownError", eventType: "settlement_executed" }, "Treasury webhook dispatch failed")
+        // Defer the read until after the write is flushed so the webhook always
+        // reflects the authoritative post-write state.
+        pendingWrites.push(async () => {
+          const updatedRecord = await settlements.findOne({ id: settlementId })
+          dispatchWebhook(webhookUrl, {
+            event: "settlement_executed",
+            settlement_id: settlementId,
+            status: updatedRecord?.status ?? "Executed",
+            merchant_address: updatedRecord?.merchant_address ?? "",
+            amount: updatedRecord?.amount ?? "0",
+            token: updatedRecord?.token ?? "",
+            tx_hash: txHash,
+          }, undefined, fetch, { eventId }).catch((err: unknown) => {
+            logger.error({ errorName: err instanceof Error ? err.name : "UnknownError", eventType: "settlement_executed" }, "Treasury webhook dispatch failed")
+          })
         })
       }
     }
@@ -306,6 +379,12 @@ export async function processIndexerBatch(
     processedIds.add(eventId)
     newEventIds.push(eventId)
     processed++
+  }
+
+  // Flush all buffered writes in bounded chunks before advancing the cursor so
+  // a crash mid-batch never leaves the cursor ahead of the persisted state.
+  if (pendingWrites.length > 0) {
+    await flushWrites(pendingWrites)
   }
 
   const lastLedger = response.latestLedger ?? cursor.last_ledger
@@ -336,13 +415,22 @@ export function startTreasuryIndexer(): void {
   }
 
   const client = buildSorobanClient(rpcUrl)
+  let indexesEnsured = false
 
   const tick = async () => {
+    const startedAt = Date.now()
     try {
       const database = await connectMongo()
+      if (!indexesEnsured) {
+        await ensureSettlementIndexes(database)
+        indexesEnsured = true
+      }
       await processIndexerBatch(client, treasuryContractId, database)
     } catch (err) {
       logger.error({ errorName: err instanceof Error ? err.name : "UnknownError" }, "Treasury indexer failed")
+    } finally {
+      indexerLedgerLag.set({ indexer: "treasury" }, indexerLedgerLag.get({ indexer: "treasury" }) ?? 0)
+      logger.debug({ durationMs: Date.now() - startedAt }, "Treasury indexer tick completed")
     }
   }
 

@@ -73,6 +73,33 @@ interface MemoryCacheEntry {
 
 const _memoryCache = new Map<string, MemoryCacheEntry>()
 
+/**
+ * Hard upper bound on the number of live in-process cache entries.
+ * Prevents unbounded memory growth when many distinct keys are written
+ * under peak load (e.g. per-merchant or per-report keys).
+ */
+export const MEMORY_CACHE_MAX_ENTRIES = 10_000
+
+/**
+ * Evicts expired entries and, if the cache is still above the size limit,
+ * drops the oldest entries (Map preserves insertion order) until it fits.
+ */
+function enforceMemoryCacheBounds(): void {
+  pruneExpiring(_memoryCache, 1_000)
+  if (_memoryCache.size <= MEMORY_CACHE_MAX_ENTRIES) return
+  const overflow = _memoryCache.size - MEMORY_CACHE_MAX_ENTRIES
+  let removed = 0
+  for (const key of _memoryCache.keys()) {
+    if (removed >= overflow) break
+    _memoryCache.delete(key)
+    removed++
+  }
+  logger.warn(
+    { evicted: removed, size: _memoryCache.size, max: MEMORY_CACHE_MAX_ENTRIES },
+    "In-process cache exceeded size limit; oldest entries evicted",
+  )
+}
+
 /** Returns the cached value for `key` if present and not yet expired. */
 export function memoryCacheGet<T>(key: string): T | null {
   const entry = _memoryCache.get(key)
@@ -86,8 +113,20 @@ export function memoryCacheGet<T>(key: string): T | null {
 
 /** Stores `value` under `key`; the TTL is a safety net for changes nobody invalidates. */
 export function memoryCacheSet(key: string, value: unknown, ttlMs: number): void {
+  // Re-insert so the entry moves to the end of the insertion order (LRU-ish).
+  _memoryCache.delete(key)
   _memoryCache.set(key, { value, expiresAt: Date.now() + ttlMs })
-  pruneExpiring(_memoryCache, 1_000)
+  enforceMemoryCacheBounds()
+}
+
+/** Current number of entries held by the in-process cache (for metrics/tests). */
+export function memoryCacheSize(): number {
+  return _memoryCache.size
+}
+
+/** Drops every entry from the in-process cache. */
+export function clearMemoryCache(): void {
+  _memoryCache.clear()
 }
 
 /**
