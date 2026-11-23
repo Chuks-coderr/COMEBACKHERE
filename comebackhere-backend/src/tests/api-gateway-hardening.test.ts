@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from "vitest"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { z } from "zod"
 import { MAX_API_KEY_LENGTH, requireMerchantApiKey } from "../middleware/apiKey.js"
+import { requireAdminKey } from "../middleware/adminAuth.js"
 import { validateBody, validateParams } from "../middleware/validate.js"
 import { errorHandler } from "../middleware/errorHandler.js"
 import {

@@ -42,22 +42,41 @@ class BoundedIdSet {
 }
 
 function symbol(topic: xdr.ScVal[] | undefined, index: number): string {
-  return topic?.[index]?.sym()?.toString() ?? ""
+  try {
+    return topic?.[index]?.sym()?.toString() ?? ""
+  } catch {
+    return ""
+  }
 }
 
 function address(value: xdr.ScVal | undefined): string {
-  return value?.address()?.toString() ?? ""
+  try {
+    return value?.address()?.toString() ?? ""
+  } catch {
+    return ""
+  }
 }
 
 function eventAddress(event: ComplianceRpcEvent, eventType: string): string {
-  return address(eventType === "address_cleared" || eventType === "address_allowed_until"
-    ? event.value?.vec()?.[0]
-    : event.value)
+  try {
+    return address(eventType === "address_cleared" || eventType === "address_allowed_until"
+      ? event.value?.vec()?.[0]
+      : event.value)
+  } catch {
+    return ""
+  }
 }
 
 function eventExpiry(event: ComplianceRpcEvent, eventType: string): number | null {
   if (eventType !== "address_allowed_until") return null
-  return Number(event.value?.vec()?.[1]?.u64()?.toString() ?? 0) || null
+  try {
+    const raw = event.value?.vec()?.[1]?.u64()?.toString()
+    if (raw === undefined) return null
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+  } catch {
+    return null
+  }
 }
 
 export function complianceEventId(event: ComplianceRpcEvent, eventType: string, addressValue: string): string {
@@ -130,19 +149,20 @@ export async function processComplianceIndexerBatch(
   }
 
   for (const event of response.events ?? []) {
+    // Advance the cursor for every event we observe, even ones we skip, so a
+    // malformed or unknown event can never wedge the indexer in a retry loop.
+    lastToken = event.pagingToken ?? lastToken
     const eventType = symbol(event.topic, 0)
     if (!EVENT_TYPES.has(eventType)) continue
     const parsed = tryParseEvent(event, (e) => ({
       addressValue: eventAddress(e, eventType), status: complianceStatusForEvent(eventType), expiresAt: eventExpiry(e, eventType),
     }))
-    if (!parsed) {
-      lastToken = event.pagingToken ?? lastToken
+    if (!parsed || !parsed.addressValue) {
       logger.warn({ eventType, pagingToken: event.pagingToken }, "Skipping malformed compliance event")
       continue
     }
     const { addressValue } = parsed
     const id = complianceEventId(event, eventType, addressValue)
-    lastToken = event.pagingToken ?? lastToken
     if (seen.has(id)) continue
     const record: ComplianceAuditRecord = {
       event_id: id,
@@ -165,6 +185,9 @@ export async function processComplianceIndexerBatch(
   }
   await flush()
 
+  const latestLedger = Number.isFinite(response.latestLedger) && (response.latestLedger ?? 0) > 0
+    ? (response.latestLedger as number)
+    : cursor.last_ledger
   await getCursorsCollection(database).updateOne(
     { _id: CURSOR_ID },
     {
@@ -175,7 +198,7 @@ export async function processComplianceIndexerBatch(
   )
   indexerLedgerLag.set(
     { indexer: "compliance" },
-    Math.max(0, (response.latestLedger ?? cursor.last_ledger) - (response.events?.at(-1)?.ledger ?? response.latestLedger ?? cursor.last_ledger)),
+    Math.max(0, latestLedger - (response.events?.at(-1)?.ledger ?? latestLedger)),
   )
   indexerBatchLatency.observe({ indexer: "compliance" }, Date.now() - startedAt)
   return processed
@@ -193,9 +216,15 @@ export function startComplianceIndexer(): void {
     // Skip overlapping polls: a slow batch must not stack concurrent DB work.
     if (tickInFlight) return
     tickInFlight = true
-    try { await processComplianceIndexerBatch(client, contractId, await connectMongo()) }
-    catch (err) { logger.error({ errorName: err instanceof Error ? err.name : "UnknownError" }, "Compliance indexer failed") }
-    finally { tickInFlight = false }
+    try {
+      const database = await connectMongo()
+      await processComplianceIndexerBatch(client, contractId, database)
+    } catch (err) {
+      logger.error(
+        { errorName: err instanceof Error ? err.name : "UnknownError", errorMessage: err instanceof Error ? err.message : String(err) },
+        "Compliance indexer failed",
+      )
+    } finally { tickInFlight = false }
   }
   void tick()
   timer = setInterval(() => void tick(), POLL_INTERVAL_MS)

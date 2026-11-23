@@ -152,6 +152,14 @@ const MAX_BUCKETS = 1000
 const SETTLED_STATUSES = ["Paid", "Released"]
 const DAY_MS = 86_400_000
 
+/** Raised when the invoice aggregation fails; mapped to a 503 by the route. */
+export class AnalyticsAggregationError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = "AnalyticsAggregationError"
+  }
+}
+
 /** Range used when start_date is omitted: 30 days, 12 weeks or 12 months. */
 const DEFAULT_RANGE_MS: Record<Bucket, number> = {
   day: 30 * DAY_MS,
@@ -159,8 +167,15 @@ const DEFAULT_RANGE_MS: Record<Bucket, number> = {
   month: 365 * DAY_MS,
 }
 
+function isValidDate(value: unknown): value is Date {
+  return value instanceof Date && !Number.isNaN(value.getTime())
+}
+
 /** Start of the UTC bucket containing `date`. */
 export function truncateUtc(date: Date, bucket: Bucket): Date {
+  if (!isValidDate(date)) {
+    throw new RangeError("truncateUtc received an invalid date")
+  }
   const y = date.getUTCFullYear()
   const m = date.getUTCMonth()
   const d = date.getUTCDate()
@@ -186,10 +201,14 @@ function periodKey(date: Date): string {
 
 /** Every bucket start from `start` to `end` inclusive. */
 export function listPeriods(start: Date, end: Date, bucket: Bucket): string[] {
+  if (!isValidDate(start) || !isValidDate(end)) {
+    throw new RangeError("listPeriods received an invalid date range")
+  }
   const periods: string[] = []
+  if (start > end) return periods
   for (let cur = truncateUtc(start, bucket); cur <= end; cur = nextBucket(cur, bucket)) {
     periods.push(periodKey(cur))
-    if (periods.length > MAX_BUCKETS) break
+    if (periods.length >= MAX_BUCKETS) break
   }
   return periods
 }
@@ -223,6 +242,13 @@ export async function buildSeries(options: {
 
   const cached = cache.get(cacheKey)
   if (cached) return cached
+
+  if (!isValidDate(start) || !isValidDate(end)) {
+    throw new RangeError("buildSeries received an invalid date range")
+  }
+  if (start > end) {
+    throw new RangeError("buildSeries start must be before end")
+  }
 
   const match: Record<string, unknown> = { created_at: { $gte: start, $lte: end } }
   if (merchant) match.merchant_address = merchant
@@ -347,11 +373,18 @@ router.get("/metrics", validateQuery(analyticsQuerySchema), async (req: Request,
           ? new Date(query.start_date * 1000)
           : new Date(end.getTime() - DEFAULT_RANGE_MS[query.bucket])
 
+      if (!isValidDate(start) || !isValidDate(end)) {
+        res.status(400).json({ error: "start_date and end_date must be valid timestamps" })
+        return
+      }
       if (start > end) {
         res.status(400).json({ error: "start_date must be before end_date" })
         return
       }
-      if (listPeriods(start, end, query.bucket).length > MAX_BUCKETS) {
+      // Compute the bucket count once; listPeriods caps at MAX_BUCKETS so a
+      // range that would exceed the cap is rejected before any DB work.
+      const periods = listPeriods(start, end, query.bucket)
+      if (periods.length >= MAX_BUCKETS) {
         res.status(400).json({
           error: `Range too large: at most ${MAX_BUCKETS} ${query.bucket} buckets per request`,
         })
@@ -409,6 +442,10 @@ router.get("/metrics", validateQuery(analyticsQuerySchema), async (req: Request,
       { errorName: error instanceof Error ? error.name : "UnknownError" },
       "Analytics metrics request failed",
     )
+    if (error instanceof RangeError) {
+      res.status(400).json({ error: error.message })
+      return
+    }
     res.status(500).json({ error: "Failed to fetch analytics metrics" })
   }
 })
